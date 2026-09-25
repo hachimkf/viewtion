@@ -1,0 +1,80 @@
+name: Build macOS DMG (Native Release)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-dmg:
+    name: Build Native macOS DMG
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './apps/desktop/src-tauri -> target'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Verify typecheck & tests
+        run: |
+          pnpm run typecheck
+          pnpm run test
+          pnpm run build
+
+      - name: Build Tauri DMG Bundle
+        run: |
+          pnpm --filter @viewtion/desktop tauri build --bundles dmg,app
+        env:
+          CI: true
+
+      - name: Locate DMG artifact
+        id: locate-dmg
+        run: |
+          DMG_PATH=$(find apps/desktop/src-tauri/target/release/bundle/dmg -name "*.dmg" | head -n 1)
+          echo "Found DMG: $DMG_PATH"
+          echo "dmg_path=$DMG_PATH" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=$(basename "$DMG_PATH")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG to GitHub Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Viewtion-macOS-DMG
+          path: ${{ steps.locate-dmg.outputs.dmg_path }}
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.locate-dmg.outputs.dmg_path }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
