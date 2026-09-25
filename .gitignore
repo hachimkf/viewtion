@@ -6,7 +6,9 @@ node_modules/
 dist/
 build/
 target/
-.vite/
+release/
+*.dmg
+*.vite/
 *.tsbuildinfo
 
 # OS & IDE
