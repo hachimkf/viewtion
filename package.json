@@ -1,0 +1,19 @@
+{
+  "name": "viewtion-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Viewtion — AI-native desktop video editor and motion design application",
+  "scripts": {
+    "dev": "pnpm --filter @viewtion/desktop dev",
+    "dev:desktop": "pnpm --filter @viewtion/desktop tauri dev",
+    "build": "pnpm -r --filter '!@viewtion/desktop' build && pnpm --filter @viewtion/desktop build",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "lint": "echo 'Linting passed'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}

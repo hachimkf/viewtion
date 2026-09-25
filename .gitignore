@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+target/
+.vite/
+*.tsbuildinfo
+
+# OS & IDE
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Tauri build outputs
+apps/desktop/src-tauri/target/
+
+# Local cache & logs
+.cache/
+logs/
+*.log
