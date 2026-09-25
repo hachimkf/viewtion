@@ -2,7 +2,7 @@
   "name": "viewtion-monorepo",
   "version": "0.1.0",
   "private": true,
-  "description": "Viewtion — AI-native desktop video editor and motion design application",
+  "packageManager": "pnpm@11.8.0",
   "scripts": {
     "dev": "pnpm --filter @viewtion/desktop dev",
     "dev:desktop": "pnpm --filter @viewtion/desktop tauri dev",
