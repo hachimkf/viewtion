@@ -527,6 +527,348 @@ export class SplitClipCommand implements ICommand {
   }
 }
 
+export class DuplicateClipCommand implements ICommand {
+  readonly id = `dup_clip_${Date.now()}`;
+  readonly name = 'Duplicate Clip';
+  private createdClipId?: string;
+
+  constructor(private clipId: string) {}
+
+  execute(project: Project): Project {
+    let foundTrack: Track | undefined;
+    let originalClip: Clip | undefined;
+
+    for (const t of project.timeline.tracks) {
+      const c = t.clips.find((item) => item.id === this.clipId);
+      if (c) {
+        foundTrack = t;
+        originalClip = c;
+        break;
+      }
+    }
+
+    if (!foundTrack || !originalClip) return project;
+
+    this.createdClipId = `${originalClip.id}_copy_${Date.now()}`;
+    const duplicatedClip: Clip = {
+      ...JSON.parse(JSON.stringify(originalClip)),
+      id: this.createdClipId,
+      name: `${originalClip.name} (Copy)`,
+      start: originalClip.start + originalClip.duration,
+    };
+
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      timeline: {
+        ...project.timeline,
+        tracks: project.timeline.tracks.map((t) => {
+          if (t.id === foundTrack!.id) {
+            return {
+              ...t,
+              clips: [...t.clips, duplicatedClip].sort((a, b) => a.start - b.start),
+            };
+          }
+          return t;
+        }),
+      },
+    };
+  }
+
+  undo(project: Project): Project {
+    if (!this.createdClipId) return project;
+    return new RemoveClipCommand(this.createdClipId).execute(project);
+  }
+
+  serialize() {
+    return { id: this.id, name: this.name, data: { clipId: this.clipId } };
+  }
+}
+
+export class RippleDeleteClipCommand implements ICommand {
+  readonly id = `ripple_del_${Date.now()}`;
+  readonly name = 'Ripple Delete Clip';
+  private removedClip?: Clip;
+  private trackId?: string;
+  private shiftAmount: number = 0;
+
+  constructor(private clipId: string) {}
+
+  execute(project: Project): Project {
+    let targetTrack: Track | undefined;
+    let targetClip: Clip | undefined;
+
+    for (const t of project.timeline.tracks) {
+      const c = t.clips.find((item) => item.id === this.clipId);
+      if (c) {
+        targetTrack = t;
+        targetClip = c;
+        break;
+      }
+    }
+
+    if (!targetTrack || !targetClip) return project;
+    this.removedClip = targetClip;
+    this.trackId = targetTrack.id;
+    this.shiftAmount = targetClip.duration;
+    const clipStart = targetClip.start;
+
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      timeline: {
+        ...project.timeline,
+        tracks: project.timeline.tracks.map((t) => {
+          if (t.id === this.trackId) {
+            return {
+              ...t,
+              clips: t.clips
+                .filter((c) => c.id !== this.clipId)
+                .map((c) => {
+                  if (c.start > clipStart) {
+                    return { ...c, start: Math.max(0, c.start - this.shiftAmount) };
+                  }
+                  return c;
+                }),
+            };
+          }
+          return t;
+        }),
+      },
+    };
+  }
+
+  undo(project: Project): Project {
+    if (!this.removedClip || !this.trackId) return project;
+    const clipStart = this.removedClip.start;
+    const shift = this.shiftAmount;
+
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      timeline: {
+        ...project.timeline,
+        tracks: project.timeline.tracks.map((t) => {
+          if (t.id === this.trackId) {
+            const restoredClips = t.clips.map((c) => {
+              if (c.start >= clipStart) {
+                return { ...c, start: c.start + shift };
+              }
+              return c;
+            });
+            return {
+              ...t,
+              clips: [...restoredClips, this.removedClip!].sort((a, b) => a.start - b.start),
+            };
+          }
+          return t;
+        }),
+      },
+    };
+  }
+
+  serialize() {
+    return { id: this.id, name: this.name, data: { clipId: this.clipId } };
+  }
+}
+
+export class SetClipPropertyCommand implements ICommand {
+  readonly id = `set_clip_prop_${Date.now()}`;
+  readonly name: string;
+  private prevValue: any;
+
+  constructor(
+    private clipId: string,
+    private propertyPath: string,
+    private newValue: any
+  ) {
+    this.name = `Set ${propertyPath} on Clip`;
+  }
+
+  execute(project: Project): Project {
+    let found = false;
+    let previous: any;
+
+    const newTracks = project.timeline.tracks.map((t) => ({
+      ...t,
+      clips: t.clips.map((c) => {
+        if (c.id === this.clipId) {
+          found = true;
+          previous = this.getValueByPath(c, this.propertyPath);
+          const cloned = JSON.parse(JSON.stringify(c));
+          return this.setValueByPath(cloned, this.propertyPath, this.newValue);
+        }
+        return c;
+      }),
+    }));
+
+    if (!found) return project;
+    this.prevValue = previous;
+
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      timeline: {
+        ...project.timeline,
+        tracks: newTracks,
+      },
+    };
+  }
+
+  undo(project: Project): Project {
+    if (this.prevValue === undefined) return project;
+    return new SetClipPropertyCommand(
+      this.clipId,
+      this.propertyPath,
+      this.prevValue
+    ).execute(project);
+  }
+
+  private getValueByPath(obj: any, path: string): any {
+    const parts = path.split('.');
+    let curr = obj;
+    for (const p of parts) {
+      if (curr === undefined || curr === null) return undefined;
+      curr = curr[p];
+    }
+    return curr;
+  }
+
+  private setValueByPath(obj: any, path: string, val: any): any {
+    const parts = path.split('.');
+    let curr = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!curr[parts[i]]) curr[parts[i]] = {};
+      curr = curr[parts[i]];
+    }
+    curr[parts[parts.length - 1]] = val;
+    return obj;
+  }
+
+  serialize() {
+    return {
+      id: this.id,
+      name: this.name,
+      data: { clipId: this.clipId, propertyPath: this.propertyPath, newValue: this.newValue },
+    };
+  }
+}
+
+export class AddTrackCommand implements ICommand {
+  readonly id = `add_track_${Date.now()}`;
+  readonly name: string;
+
+  constructor(private trackType: 'video' | 'audio' | 'graphics', private trackName?: string) {
+    this.name = `Add ${trackType.toUpperCase()} Track`;
+  }
+
+  execute(project: Project): Project {
+    const newTrack: Track = {
+      id: `track_${this.trackType}_${Date.now()}`,
+      name: this.trackName || `${this.trackType.charAt(0).toUpperCase() + this.trackType.slice(1)} ${project.timeline.tracks.length + 1}`,
+      type: this.trackType,
+      locked: false,
+      muted: false,
+      visible: true,
+      clips: [],
+    };
+
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      timeline: {
+        ...project.timeline,
+        tracks: [...project.timeline.tracks, newTrack],
+      },
+    };
+  }
+
+  undo(project: Project): Project {
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      timeline: {
+        ...project.timeline,
+        tracks: project.timeline.tracks.slice(0, -1),
+      },
+    };
+  }
+
+  serialize() {
+    return { id: this.id, name: this.name, data: { trackType: this.trackType, trackName: this.trackName } };
+  }
+}
+
+export class RemoveKeyframeCommand implements ICommand {
+  readonly id = `rem_kf_${Date.now()}`;
+  readonly name = 'Remove Keyframe';
+  private removedKf?: Keyframe;
+
+  constructor(
+    private compositionId: string,
+    private layerId: string,
+    private propertyName: string,
+    private keyframeId: string
+  ) {}
+
+  execute(project: Project): Project {
+    const comp = project.motionCompositions[this.compositionId];
+    if (!comp) return project;
+    const layer = comp.layers.find((l) => l.id === this.layerId);
+    if (!layer || !layer.keyframes) return project;
+
+    const list = layer.keyframes[this.propertyName] || [];
+    this.removedKf = list.find((k) => k.id === this.keyframeId);
+    if (!this.removedKf) return project;
+
+    return {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      motionCompositions: {
+        ...project.motionCompositions,
+        [this.compositionId]: {
+          ...comp,
+          layers: comp.layers.map((l) => {
+            if (l.id === this.layerId) {
+              return {
+                ...l,
+                keyframes: {
+                  ...l.keyframes,
+                  [this.propertyName]: list.filter((k) => k.id !== this.keyframeId),
+                },
+              };
+            }
+            return l;
+          }),
+        },
+      },
+    };
+  }
+
+  undo(project: Project): Project {
+    if (!this.removedKf) return project;
+    return new AddKeyframeCommand(
+      this.compositionId,
+      this.layerId,
+      this.propertyName,
+      this.removedKf
+    ).execute(project);
+  }
+
+  serialize() {
+    return {
+      id: this.id,
+      name: this.name,
+      data: {
+        compositionId: this.compositionId,
+        layerId: this.layerId,
+        propertyName: this.propertyName,
+        keyframeId: this.keyframeId,
+      },
+    };
+  }
+}
+
 // -------------------------------------------------------------
 // Motion Composition Commands
 // -------------------------------------------------------------

@@ -1,5 +1,7 @@
 import { Project, Clip } from '@viewtion/project-schema';
 
+export * from './audioMedia';
+
 export function formatTimecode(seconds: number, fps: number = 30): string {
   const totalSecs = Math.max(0, Math.floor(seconds));
   const mins = Math.floor(totalSecs / 60);

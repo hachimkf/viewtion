@@ -59,6 +59,55 @@ export const AssetSchema = z.object({
 });
 export type Asset = z.infer<typeof AssetSchema>;
 
+export const ClipEffectTypeSchema = z.enum([
+  'brightness',
+  'contrast',
+  'saturation',
+  'exposure',
+  'temperature',
+  'tint',
+  'blur',
+  'sharpen',
+  'vignette',
+  'grayscale',
+  'sepia',
+]);
+export type ClipEffectType = z.infer<typeof ClipEffectTypeSchema>;
+
+export const ClipEffectSchema = z.object({
+  id: z.string(),
+  type: ClipEffectTypeSchema,
+  value: z.number().default(0),
+  enabled: z.boolean().default(true),
+});
+export type ClipEffect = z.infer<typeof ClipEffectSchema>;
+
+export const TransitionTypeSchema = z.enum([
+  'none',
+  'crossDissolve',
+  'dipToBlack',
+  'dipToWhite',
+  'slideLeft',
+  'slideRight',
+  'push',
+  'wipe',
+]);
+export type TransitionType = z.infer<typeof TransitionTypeSchema>;
+
+export const ClipTransitionSchema = z.object({
+  type: TransitionTypeSchema.default('none'),
+  duration: z.number().default(0.5),
+});
+export type ClipTransition = z.infer<typeof ClipTransitionSchema>;
+
+export const CropSchema = z.object({
+  left: z.number().default(0),
+  right: z.number().default(0),
+  top: z.number().default(0),
+  bottom: z.number().default(0),
+});
+export type Crop = z.infer<typeof CropSchema>;
+
 export const BaseClipSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -76,6 +125,9 @@ export const BaseClipSchema = z.object({
   opacity: z.number().default(1),
   locked: z.boolean().default(false),
   keyframes: z.record(z.array(KeyframeSchema)).optional(),
+  effects: z.array(ClipEffectSchema).optional(),
+  transition: ClipTransitionSchema.optional(),
+  crop: CropSchema.optional(),
 });
 
 export const VideoClipSchema = BaseClipSchema.extend({

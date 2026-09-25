@@ -7,7 +7,7 @@
     "dev": "pnpm --filter @viewtion/desktop dev",
     "dev:desktop": "pnpm --filter @viewtion/desktop tauri dev",
     "build": "pnpm -r --filter '!@viewtion/desktop' build && pnpm --filter @viewtion/desktop build",
-    "typecheck": "tsc -b",
+    "typecheck": "pnpm -r exec tsc --noEmit",
     "test": "vitest run",
     "lint": "echo 'Linting passed'"
   },

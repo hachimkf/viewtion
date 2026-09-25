@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import {
   FolderKanban,
   FileVideo,
@@ -11,7 +11,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Download,
-  Maximize2,
   Grid,
   Lock,
   Unlock,
@@ -26,6 +25,13 @@ import {
   Redo2,
   Layers,
   ArrowRight,
+  Copy,
+  Trash2,
+  Sliders,
+  Crop,
+  Zap,
+  SlidersHorizontal,
+  Wand2,
 } from 'lucide-react';
 import {
   ActiveWorkspace,
@@ -43,13 +49,54 @@ import {
   RemoveClipCommand,
   AddClipCommand,
   AddAssetCommand,
+  DuplicateClipCommand,
+  RippleDeleteClipCommand,
+  SetClipPropertyCommand,
+  AddTrackCommand,
 } from '@viewtion/editor-core';
-import { formatTimecode, formatTimecodeDetailed } from '@viewtion/video-engine';
-import { Asset, Clip, VideoClip, MotionCompositionClip, TextClip } from '@viewtion/project-schema';
+import {
+  formatTimecode,
+  formatTimecodeDetailed,
+  findSnapTime,
+  extractVideoMetadata,
+  extractWaveformFromFile,
+} from '@viewtion/video-engine';
+import {
+  Asset,
+  Clip,
+  VideoClip,
+  MotionCompositionClip,
+  TextClip,
+  AudioClip,
+  ClipEffect,
+  ClipTransition,
+} from '@viewtion/project-schema';
 
 interface VideoWorkspaceProps {
   onNavigate: (workspace: ActiveWorkspace) => void;
   onOpenMotionComp: (compId: string) => void;
+}
+
+interface DragState {
+  clipId: string;
+  originalStart: number;
+  originalTrackId: string;
+  startX: number;
+  startY: number;
+  currentStart: number;
+  targetTrackId: string;
+}
+
+interface TrimState {
+  clipId: string;
+  handle: 'left' | 'right';
+  startX: number;
+  originalStart: number;
+  originalDuration: number;
+  originalIn: number;
+  originalOut: number;
+  currentStart: number;
+  currentDuration: number;
 }
 
 export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOpenMotionComp }) => {
@@ -61,15 +108,51 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
   const [isPlaying, setIsPlaying] = useState(false);
   const [activeTab, setActiveTab] = useState<'media' | 'effects' | 'transitions' | 'text' | 'audio' | 'captions' | 'templates'>('media');
   const [assetFilter, setAssetFilter] = useState<'all' | 'video' | 'images' | 'audio'>('all');
-  const [timelineZoom, setTimelineZoom] = useState(45); // pixels per second
+  const [timelineZoom, setTimelineZoom] = useState(50); // pixels per second
   const [showGuides, setShowGuides] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
 
+  // Inspector toggle
+  const [showInspector, setShowInspector] = useState(true);
+
+  // Dragging & Trimming interaction state
+  const [dragState, setDragState] = useState<DragState | null>(null);
+  const [trimState, setTrimState] = useState<TrimState | null>(null);
+  const [snapLineTime, setSnapLineTime] = useState<number | null>(null);
+
+  // Clipboard for copy/paste
+  const [clipboardClip, setClipboardClip] = useState<Clip | null>(null);
+
+  // Media Elements Pool (HTMLVideoElement / HTMLImageElement)
+  const mediaPoolRef = useRef<Map<string, HTMLVideoElement | HTMLImageElement>>(new Map());
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const timelineScrollRef = useRef<HTMLDivElement>(null);
+  const tracksContainerRef = useRef<HTMLDivElement>(null);
 
-  // Render video preview canvas whenever time or project changes
+  // Load assets into media pool when project.assets change
+  useEffect(() => {
+    for (const asset of Object.values(project.assets)) {
+      if (!asset.src) continue;
+      if (!mediaPoolRef.current.has(asset.id)) {
+        if (asset.type === 'video') {
+          const video = document.createElement('video');
+          video.src = asset.src;
+          video.preload = 'auto';
+          video.muted = true;
+          video.playsInline = true;
+          mediaPoolRef.current.set(asset.id, video);
+        } else if (asset.type === 'image') {
+          const img = new Image();
+          img.src = asset.src;
+          mediaPoolRef.current.set(asset.id, img);
+        }
+      }
+    }
+  }, [project.assets]);
+
+  // Render video preview canvas whenever time, project, or interaction changes
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -80,11 +163,12 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
       width: canvas.width,
       height: canvas.height,
       time: currentTime,
+      mediaElements: mediaPoolRef.current,
       showGuides,
     });
   }, [project, currentTime, showGuides]);
 
-  // Playback loop
+  // Playback loop with accurate time synchronization
   useEffect(() => {
     let animId: number;
     let lastStamp: number | null = null;
@@ -128,47 +212,274 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
     globalStore.setCurrentTime(Math.max(0, Math.min(project.settings.duration, time)));
   };
 
+  // Find currently selected clip object
+  let selectedClip: Clip | undefined;
+  let selectedTrack: { id: string; name: string; type: string } | undefined;
+  if (selection.type === 'clip' && selection.id) {
+    for (const t of project.timeline.tracks) {
+      const found = t.clips.find((c) => c.id === selection.id);
+      if (found) {
+        selectedClip = found;
+        selectedTrack = { id: t.id, name: t.name, type: t.type };
+        break;
+      }
+    }
+  }
+
+  // Split clip at playhead
   const handleSplitAtPlayhead = () => {
-    if (selection.type === 'clip' && selection.id) {
-      globalStore.dispatch(new SplitClipCommand(selection.id, currentTime));
-    } else {
-      // Find first clip intersecting playhead
-      for (const t of project.timeline.tracks) {
-        for (const c of t.clips) {
-          if (currentTime > c.start && currentTime < c.start + c.duration) {
-            globalStore.dispatch(new SplitClipCommand(c.id, currentTime));
-            return;
-          }
+    if (selectedClip) {
+      if (currentTime > selectedClip.start && currentTime < selectedClip.start + selectedClip.duration) {
+        globalStore.dispatch(new SplitClipCommand(selectedClip.id, currentTime));
+        return;
+      }
+    }
+    // Fallback: find any clip intersecting playhead
+    for (const t of project.timeline.tracks) {
+      for (const c of t.clips) {
+        if (currentTime > c.start && currentTime < c.start + c.duration) {
+          globalStore.dispatch(new SplitClipCommand(c.id, currentTime));
+          return;
         }
       }
     }
   };
 
+  // Duplicate clip
+  const handleDuplicateSelected = () => {
+    if (selectedClip) {
+      globalStore.dispatch(new DuplicateClipCommand(selectedClip.id));
+    }
+  };
+
+  // Delete clip (standard)
   const handleDeleteSelected = () => {
-    if (selection.type === 'clip' && selection.id) {
-      globalStore.dispatch(new RemoveClipCommand(selection.id));
+    if (selectedClip) {
+      globalStore.dispatch(new RemoveClipCommand(selectedClip.id));
       globalSelection.clear();
     }
   };
 
-  const handleImportAssetFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
+  // Ripple delete clip
+  const handleRippleDeleteSelected = () => {
+    if (selectedClip) {
+      globalStore.dispatch(new RippleDeleteClipCommand(selectedClip.id));
+      globalSelection.clear();
+    }
+  };
+
+  // Copy clip
+  const handleCopySelected = () => {
+    if (selectedClip) {
+      setClipboardClip(JSON.parse(JSON.stringify(selectedClip)));
+    }
+  };
+
+  // Paste clip at playhead
+  const handlePasteAtPlayhead = () => {
+    if (clipboardClip) {
+      const targetTrackId = selectedTrack?.id || project.timeline.tracks[0]?.id;
+      if (targetTrackId) {
+        const pasted: Clip = {
+          ...clipboardClip,
+          id: `clip_${Date.now()}`,
+          start: currentTime,
+        };
+        globalStore.dispatch(new AddClipCommand(targetTrackId, pasted));
+        globalSelection.select({ type: 'clip', id: pasted.id });
+      }
+    }
+  };
+
+  // Keyboard shortcut listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore if typing in text inputs or textareas
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        handleSplitAtPlayhead();
+      } else if (e.key.toLowerCase() === 'b' && !e.metaKey && !e.ctrlKey) {
+        handleSplitAtPlayhead();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
+        e.preventDefault();
+        handleDuplicateSelected();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c') {
+        e.preventDefault();
+        handleCopySelected();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') {
+        e.preventDefault();
+        handlePasteAtPlayhead();
+      } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handleRippleDeleteSelected();
+        } else {
+          handleDeleteSelected();
+        }
+      } else if (e.key === ' ') {
+        e.preventDefault();
+        handlePlayPause();
+      } else if (e.key === '=' || e.key === '+') {
+        setTimelineZoom((z) => Math.min(120, z + 10));
+      } else if (e.key === '-' || e.key === '_') {
+        setTimelineZoom((z) => Math.max(20, z - 10));
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedClip, currentTime, clipboardClip, isPlaying]);
+
+  // Pointer move & up handlers for timeline dragging & trimming
+  useEffect(() => {
+    const handlePointerMove = (e: PointerEvent) => {
+      if (dragState) {
+        const deltaX = (e.clientX - dragState.startX) / timelineZoom;
+        let candidateStart = Math.max(0, dragState.originalStart + deltaX);
+
+        // Magnetic snapping
+        const snapped = findSnapTime(candidateStart, project, dragState.clipId, 0.15);
+        if (Math.abs(snapped - candidateStart) < 0.15) {
+          candidateStart = snapped;
+          setSnapLineTime(snapped);
+        } else {
+          setSnapLineTime(null);
+        }
+
+        // Determine target track based on clientY
+        let targetTrackId = dragState.originalTrackId;
+        if (tracksContainerRef.current) {
+          const trackElements = tracksContainerRef.current.querySelectorAll('[data-track-id]');
+          trackElements.forEach((el) => {
+            const rect = el.getBoundingClientRect();
+            if (e.clientY >= rect.top && e.clientY <= rect.bottom) {
+              const tid = el.getAttribute('data-track-id');
+              const ttype = el.getAttribute('data-track-type');
+              if (tid && ttype) {
+                // Ensure compatible track type
+                const isAudClip = selectedClip?.type === 'audio';
+                if ((isAudClip && ttype === 'audio') || (!isAudClip && ttype !== 'audio')) {
+                  targetTrackId = tid;
+                }
+              }
+            }
+          });
+        }
+
+        setDragState((prev) => (prev ? { ...prev, currentStart: candidateStart, targetTrackId } : null));
+      } else if (trimState) {
+        const deltaX = (e.clientX - trimState.startX) / timelineZoom;
+        if (trimState.handle === 'left') {
+          const maxStart = trimState.originalStart + trimState.originalDuration - 0.2;
+          const newStart = Math.min(maxStart, Math.max(0, trimState.originalStart + deltaX));
+          const diff = newStart - trimState.originalStart;
+          const newDuration = trimState.originalDuration - diff;
+          setTrimState((prev) => (prev ? { ...prev, currentStart: newStart, currentDuration: newDuration } : null));
+        } else {
+          const newDuration = Math.max(0.2, trimState.originalDuration + deltaX);
+          setTrimState((prev) => (prev ? { ...prev, currentDuration: newDuration } : null));
+        }
+      }
+    };
+
+    const handlePointerUp = () => {
+      if (dragState) {
+        if (dragState.currentStart !== dragState.originalStart || dragState.targetTrackId !== dragState.originalTrackId) {
+          globalStore.dispatch(
+            new MoveClipCommand(dragState.clipId, dragState.currentStart, dragState.targetTrackId)
+          );
+        }
+        setDragState(null);
+        setSnapLineTime(null);
+      } else if (trimState) {
+        if (trimState.handle === 'left') {
+          const diff = trimState.currentStart - trimState.originalStart;
+          const newIn = Math.max(0, trimState.originalIn + diff);
+          globalStore.dispatch(
+            new TrimClipCommand(
+              trimState.clipId,
+              trimState.currentStart,
+              trimState.currentDuration,
+              newIn,
+              trimState.originalOut
+            )
+          );
+        } else {
+          const newOut = trimState.originalIn + trimState.currentDuration;
+          globalStore.dispatch(
+            new TrimClipCommand(
+              trimState.clipId,
+              trimState.originalStart,
+              trimState.currentDuration,
+              trimState.originalIn,
+              newOut
+            )
+          );
+        }
+        setTrimState(null);
+      }
+    };
+
+    if (dragState || trimState) {
+      window.addEventListener('pointermove', handlePointerMove);
+      window.addEventListener('pointerup', handlePointerUp);
+    }
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [dragState, trimState, timelineZoom, project, selectedClip]);
+
+  // File import handler with real metadata extraction
+  const handleImportAssetFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
       const isVideo = file.type.startsWith('video');
       const isAudio = file.type.startsWith('audio');
       const isImg = file.type.startsWith('image');
 
-      const url = URL.createObjectURL(file);
-      const newAsset: Asset = {
-        id: `asset_${Date.now()}`,
-        name: file.name,
-        type: isVideo ? 'video' : isAudio ? 'audio' : 'image',
-        src: url,
-        duration: 10,
-        thumbnail: isImg ? url : undefined,
-      };
-
-      globalStore.dispatch(new AddAssetCommand(newAsset));
+      if (isVideo) {
+        const meta = await extractVideoMetadata(file);
+        const newAsset: Asset = {
+          id: `asset_${Date.now()}_${i}`,
+          name: file.name,
+          type: 'video',
+          src: meta.url,
+          duration: meta.duration,
+          width: meta.width,
+          height: meta.height,
+          thumbnail: meta.thumbnail,
+        };
+        globalStore.dispatch(new AddAssetCommand(newAsset));
+      } else if (isAudio) {
+        const peaks = await extractWaveformFromFile(file);
+        const url = URL.createObjectURL(file);
+        const newAsset: Asset = {
+          id: `asset_${Date.now()}_${i}`,
+          name: file.name,
+          type: 'audio',
+          src: url,
+          duration: 30,
+          waveform: peaks.length > 0 ? peaks : undefined,
+        };
+        globalStore.dispatch(new AddAssetCommand(newAsset));
+      } else if (isImg) {
+        const url = URL.createObjectURL(file);
+        const newAsset: Asset = {
+          id: `asset_${Date.now()}_${i}`,
+          name: file.name,
+          type: 'image',
+          src: url,
+          thumbnail: url,
+        };
+        globalStore.dispatch(new AddAssetCommand(newAsset));
+      }
     }
   };
 
@@ -207,7 +518,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `${project.name.replace(/\s+/g, '_')}_1080x1350.webm`;
+        a.download = `${project.name.replace(/\s+/g, '_')}_rendered.webm`;
         a.click();
         setIsExporting(false);
         setExportProgress(0);
@@ -217,7 +528,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
 
       let renderTime = 0;
       const stepInterval = 1 / 30;
-      const exportDuration = Math.min(10, project.settings.duration); // render first 10s for fast preview export
+      const exportDuration = Math.min(15, project.settings.duration);
 
       const timer = setInterval(() => {
         renderTime += stepInterval;
@@ -230,25 +541,12 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
         }
       }, 33);
     } catch (err) {
-      console.warn('Canvas capture stream export fallback:', err);
+      console.warn('Canvas export:', err);
       setTimeout(() => {
         setIsExporting(false);
-        alert('Export simulated successfully.');
       }, 1500);
     }
   };
-
-  // Find selected clip object if any
-  let selectedClip: Clip | undefined;
-  if (selection.type === 'clip' && selection.id) {
-    for (const t of project.timeline.tracks) {
-      const found = t.clips.find((c) => c.id === selection.id);
-      if (found) {
-        selectedClip = found;
-        break;
-      }
-    }
-  }
 
   const assetsList = Object.values(project.assets).filter((a) => {
     if (assetFilter === 'all') return true;
@@ -260,7 +558,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', backgroundColor: '#0D0D10' }}>
-      <input type="file" ref={fileInputRef} style={{ display: 'none' }} onChange={handleImportAssetFile} />
+      <input type="file" ref={fileInputRef} multiple style={{ display: 'none' }} onChange={handleImportAssetFile} />
 
       {/* Top Header Bar */}
       <div
@@ -326,7 +624,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             <span style={{ fontSize: '10px' }}>▾</span>
           </div>
 
-          {/* Quick Undo / Redo */}
+          {/* Undo / Redo */}
           <div style={{ display: 'flex', gap: '4px' }}>
             <button
               onClick={() => globalStore.undo()}
@@ -359,7 +657,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
           </div>
         </div>
 
-        {/* Right: Motion workspace jump & Export Button */}
+        {/* Right: Motion workspace jump, Inspector toggle, Save & Export */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <button
             onClick={() => onNavigate('motion')}
@@ -379,6 +677,22 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
           >
             <Layers size={14} />
             Motion Editor
+          </button>
+
+          <button
+            onClick={() => setShowInspector(!showInspector)}
+            style={{
+              backgroundColor: showInspector ? '#242432' : '#1C1C22',
+              border: '1px solid #282834',
+              color: showInspector ? '#E2F952' : '#94A3B8',
+              padding: '6px 12px',
+              borderRadius: '20px',
+              fontSize: '12px',
+              fontWeight: 500,
+              cursor: 'pointer',
+            }}
+          >
+            Inspector
           </button>
 
           <button
@@ -420,7 +734,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
         </div>
       </div>
 
-      {/* Middle Work Area (Sidebar + Assets + Video Canvas) */}
+      {/* Middle Work Area (Sidebar + Assets + Video Canvas + Inspector) */}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         {/* Far-Left Vertical Icon Tab Bar */}
         <div
@@ -519,7 +833,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
           </div>
         </div>
 
-        {/* Media / Asset Browser Panel */}
+        {/* Media / Asset Browser Panel with Drag & Drop */}
         <div
           style={{
             width: '280px',
@@ -529,6 +843,13 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             flexDirection: 'column',
             padding: '16px',
             overflowY: 'auto',
+          }}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+              handleImportAssetFile({ target: { files: e.dataTransfer.files } } as any);
+            }
           }}
         >
           {/* Filter Pills */}
@@ -579,12 +900,17 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             {assetsList.map((asset) => (
               <div
                 key={asset.id}
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData('text/plain', asset.id);
+                  e.dataTransfer.effectAllowed = 'copy';
+                }}
                 onClick={() => {
-                  // Add asset to timeline on click
+                  // Direct click adds to timeline
                   const isVideo = asset.type === 'video';
                   const targetTrack = isVideo
-                    ? project.timeline.tracks[1]
-                    : project.timeline.tracks[2];
+                    ? project.timeline.tracks.find((t) => t.type === 'video') || project.timeline.tracks[0]
+                    : project.timeline.tracks.find((t) => t.type === 'audio') || project.timeline.tracks[0];
 
                   if (targetTrack) {
                     const newClip: Clip = isVideo
@@ -600,6 +926,8 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                           speed: 1,
                           opacity: 1,
                           locked: false,
+                          keyframes: {},
+                          effects: [],
                           transform: {
                             position: { x: 0, y: 0 },
                             scale: { x: 1, y: 1 },
@@ -619,6 +947,8 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                           speed: 1,
                           opacity: 1,
                           locked: false,
+                          keyframes: {},
+                          effects: [],
                           volume: 0.8,
                           fadeIn: 0,
                           fadeOut: 0,
@@ -631,6 +961,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                         };
 
                     globalStore.dispatch(new AddClipCommand(targetTrack.id, newClip));
+                    globalSelection.select({ type: 'clip', id: newClip.id });
                   }
                 }}
                 style={{
@@ -639,9 +970,10 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                   borderRadius: '8px',
                   border: '1px solid #24242E',
                   overflow: 'hidden',
-                  cursor: 'pointer',
+                  cursor: 'grab',
                   position: 'relative',
                 }}
+                title="Click or drag to timeline"
               >
                 <div
                   style={{
@@ -655,9 +987,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                     justifyContent: 'center',
                   }}
                 >
-                  {!asset.thumbnail && (
-                    <FileVideo size={20} color="#64748B" />
-                  )}
+                  {!asset.thumbnail && <FileVideo size={20} color="#64748B" />}
                 </div>
                 <div
                   style={{
@@ -693,7 +1023,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             padding: '16px',
           }}
         >
-          {/* Dynamic Link Notification Pill if Motion Clip selected */}
+          {/* Dynamic Motion Link Pill */}
           {selectedClip && selectedClip.type === 'motionComposition' && (
             <div
               style={{
@@ -735,7 +1065,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             </div>
           )}
 
-          {/* Video Preview Canvas with aspect ratio 4:5 (1080x1350) */}
+          {/* Canvas container */}
           <div
             style={{
               position: 'relative',
@@ -850,6 +1180,342 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             </button>
           </div>
         </div>
+
+        {/* Right Inspector Panel */}
+        {showInspector && (
+          <div
+            style={{
+              width: '300px',
+              backgroundColor: '#141418',
+              borderLeft: '1px solid #26262E',
+              display: 'flex',
+              flexDirection: 'column',
+              overflowY: 'auto',
+              padding: '16px',
+            }}
+          >
+            {selectedClip ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                {/* Header with Name & Type */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <h3 style={{ fontSize: '14px', fontWeight: 600, color: '#FFFFFF' }}>{selectedClip.name}</h3>
+                    <span style={{ fontSize: '11px', color: '#9D7BFF', textTransform: 'uppercase', fontWeight: 600 }}>
+                      {selectedClip.type}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => globalSelection.clear()}
+                    style={{ background: 'none', border: 'none', color: '#64748B', cursor: 'pointer', fontSize: '12px' }}
+                  >
+                    Deselect
+                  </button>
+                </div>
+
+                {/* Transform Controls */}
+                <div style={{ backgroundColor: '#181820', borderRadius: '8px', padding: '12px', border: '1px solid #24242E' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8', display: 'block', marginBottom: '10px' }}>
+                    TRANSFORM
+                  </span>
+
+                  {/* Position X / Y */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', fontSize: '12px' }}>
+                    <span style={{ color: '#64748B' }}>Position</span>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <input
+                        type="number"
+                        value={selectedClip.transform.position.x}
+                        onChange={(e) =>
+                          globalStore.dispatch(
+                            new SetClipPropertyCommand(selectedClip!.id, 'transform.position.x', Number(e.target.value))
+                          )
+                        }
+                        style={{ width: '56px', background: '#121216', border: '1px solid #2A2A36', color: '#FFF', padding: '3px 6px', borderRadius: '4px', fontSize: '11px' }}
+                      />
+                      <input
+                        type="number"
+                        value={selectedClip.transform.position.y}
+                        onChange={(e) =>
+                          globalStore.dispatch(
+                            new SetClipPropertyCommand(selectedClip!.id, 'transform.position.y', Number(e.target.value))
+                          )
+                        }
+                        style={{ width: '56px', background: '#121216', border: '1px solid #2A2A36', color: '#FFF', padding: '3px 6px', borderRadius: '4px', fontSize: '11px' }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Scale */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', fontSize: '12px' }}>
+                    <span style={{ color: '#64748B' }}>Scale</span>
+                    <input
+                      type="range"
+                      min="0.1"
+                      max="3"
+                      step="0.05"
+                      value={selectedClip.transform.scale.x}
+                      onChange={(e) => {
+                        const s = Number(e.target.value);
+                        globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'transform.scale.x', s));
+                        globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'transform.scale.y', s));
+                      }}
+                      style={{ width: '120px', accentColor: '#E2F952' }}
+                    />
+                  </div>
+
+                  {/* Rotation */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', fontSize: '12px' }}>
+                    <span style={{ color: '#64748B' }}>Rotation</span>
+                    <input
+                      type="number"
+                      value={selectedClip.transform.rotation}
+                      onChange={(e) =>
+                        globalStore.dispatch(
+                          new SetClipPropertyCommand(selectedClip!.id, 'transform.rotation', Number(e.target.value))
+                        )
+                      }
+                      style={{ width: '56px', background: '#121216', border: '1px solid #2A2A36', color: '#FFF', padding: '3px 6px', borderRadius: '4px', fontSize: '11px' }}
+                    />
+                  </div>
+
+                  {/* Opacity */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                    <span style={{ color: '#64748B' }}>Opacity</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={selectedClip.opacity}
+                      onChange={(e) =>
+                        globalStore.dispatch(
+                          new SetClipPropertyCommand(selectedClip!.id, 'opacity', Number(e.target.value))
+                        )
+                      }
+                      style={{ width: '120px', accentColor: '#E2F952' }}
+                    />
+                  </div>
+                </div>
+
+                {/* Speed Controls */}
+                <div style={{ backgroundColor: '#181820', borderRadius: '8px', padding: '12px', border: '1px solid #24242E' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>SPEED</span>
+                    <span style={{ fontSize: '12px', color: '#E2F952', fontWeight: 600 }}>{selectedClip.speed}x</span>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    {[0.5, 0.75, 1.0, 1.5, 2.0].map((spd) => (
+                      <button
+                        key={spd}
+                        onClick={() =>
+                          globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'speed', spd))
+                        }
+                        style={{
+                          flex: 1,
+                          padding: '4px 0',
+                          borderRadius: '4px',
+                          border: 'none',
+                          cursor: 'pointer',
+                          fontSize: '11px',
+                          backgroundColor: selectedClip!.speed === spd ? '#E2F952' : '#22222E',
+                          color: selectedClip!.speed === spd ? '#0D0D10' : '#CBD5E1',
+                          fontWeight: selectedClip!.speed === spd ? 700 : 400,
+                        }}
+                      >
+                        {spd}x
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Color & Effects Stack */}
+                <div style={{ backgroundColor: '#181820', borderRadius: '8px', padding: '12px', border: '1px solid #24242E' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>EFFECTS & COLOR</span>
+                    <button
+                      onClick={() => {
+                        const existing = selectedClip!.effects || [];
+                        const newEff: ClipEffect = {
+                          id: `eff_${Date.now()}`,
+                          type: 'brightness',
+                          value: 0.2,
+                          enabled: true,
+                        };
+                        globalStore.dispatch(
+                          new SetClipPropertyCommand(selectedClip!.id, 'effects', [...existing, newEff])
+                        );
+                      }}
+                      style={{
+                        background: '#22222E',
+                        border: '1px solid #323240',
+                        borderRadius: '4px',
+                        color: '#E2F952',
+                        fontSize: '10px',
+                        padding: '2px 8px',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      + Add Effect
+                    </button>
+                  </div>
+
+                  {/* Render list of active effects */}
+                  {(selectedClip.effects || []).map((eff, idx) => (
+                    <div
+                      key={eff.id}
+                      style={{
+                        backgroundColor: '#121216',
+                        borderRadius: '6px',
+                        padding: '8px',
+                        marginBottom: '6px',
+                        border: '1px solid #22222A',
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                        <select
+                          value={eff.type}
+                          onChange={(e) => {
+                            const updated = [...(selectedClip!.effects || [])];
+                            updated[idx] = { ...eff, type: e.target.value as any };
+                            globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'effects', updated));
+                          }}
+                          style={{
+                            background: '#1A1A22',
+                            color: '#FFF',
+                            border: '1px solid #2A2A34',
+                            borderRadius: '4px',
+                            fontSize: '11px',
+                            padding: '2px 4px',
+                          }}
+                        >
+                          <option value="brightness">Brightness</option>
+                          <option value="contrast">Contrast</option>
+                          <option value="saturation">Saturation</option>
+                          <option value="blur">Blur</option>
+                          <option value="grayscale">Grayscale</option>
+                          <option value="sepia">Sepia</option>
+                        </select>
+
+                        <button
+                          onClick={() => {
+                            const updated = (selectedClip!.effects || []).filter((_, i) => i !== idx);
+                            globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'effects', updated));
+                          }}
+                          style={{ background: 'none', border: 'none', color: '#EF4444', cursor: 'pointer', fontSize: '11px' }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <input
+                          type="range"
+                          min={eff.type === 'blur' ? '0' : '-0.8'}
+                          max={eff.type === 'blur' ? '20' : '1.5'}
+                          step="0.05"
+                          value={eff.value}
+                          onChange={(e) => {
+                            const updated = [...(selectedClip!.effects || [])];
+                            updated[idx] = { ...eff, value: Number(e.target.value) };
+                            globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'effects', updated));
+                          }}
+                          style={{ flex: 1, accentColor: '#E2F952' }}
+                        />
+                        <span style={{ fontSize: '10px', color: '#94A3B8', width: '32px', textAlign: 'right' }}>
+                          {eff.value.toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Transition Settings */}
+                <div style={{ backgroundColor: '#181820', borderRadius: '8px', padding: '12px', border: '1px solid #24242E' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8', display: 'block', marginBottom: '8px' }}>
+                    IN-TRANSITION
+                  </span>
+
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                    <select
+                      value={selectedClip.transition?.type || 'none'}
+                      onChange={(e) => {
+                        const val = e.target.value as any;
+                        const trans: ClipTransition = {
+                          type: val,
+                          duration: selectedClip!.transition?.duration || 0.5,
+                        };
+                        globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'transition', trans));
+                      }}
+                      style={{
+                        flex: 1,
+                        background: '#121216',
+                        color: '#FFF',
+                        border: '1px solid #2A2A36',
+                        borderRadius: '4px',
+                        padding: '4px 6px',
+                        fontSize: '11px',
+                      }}
+                    >
+                      <option value="none">None</option>
+                      <option value="crossDissolve">Cross Dissolve</option>
+                      <option value="dipToBlack">Dip to Black</option>
+                      <option value="slideLeft">Slide Left</option>
+                      <option value="wipe">Wipe</option>
+                    </select>
+                  </div>
+
+                  {selectedClip.transition && selectedClip.transition.type !== 'none' && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
+                      <span style={{ color: '#64748B' }}>Duration</span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        max="3"
+                        value={selectedClip.transition.duration}
+                        onChange={(e) => {
+                          const trans = { ...selectedClip!.transition!, duration: Number(e.target.value) };
+                          globalStore.dispatch(new SetClipPropertyCommand(selectedClip!.id, 'transition', trans));
+                        }}
+                        style={{ width: '50px', background: '#121216', border: '1px solid #2A2A36', color: '#FFF', padding: '2px 4px', borderRadius: '4px' }}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Audio controls if audio or video clip */}
+                {(selectedClip.type === 'audio' || 'volume' in (selectedClip as any)) && (
+                  <div style={{ backgroundColor: '#181820', borderRadius: '8px', padding: '12px', border: '1px solid #24242E' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8', display: 'block', marginBottom: '8px' }}>
+                      AUDIO VOLUME
+                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <Volume2 size={14} color="#64748B" />
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={(selectedClip as AudioClip).volume ?? 1}
+                        onChange={(e) =>
+                          globalStore.dispatch(
+                            new SetClipPropertyCommand(selectedClip!.id, 'volume', Number(e.target.value))
+                          )
+                        }
+                        style={{ flex: 1, accentColor: '#22C55E' }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ padding: '24px 0', textAlign: 'center', color: '#64748B', fontSize: '12px' }}>
+                Select a clip on the timeline to edit properties, color, effects, and transitions.
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Bottom Multitrack Timeline Area */}
@@ -860,6 +1526,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
           borderTop: '1px solid #26262E',
           display: 'flex',
           flexDirection: 'column',
+          userSelect: 'none',
         }}
       >
         {/* Timeline Toolbar */}
@@ -874,7 +1541,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             padding: '0 16px',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <button
               onClick={handleSplitAtPlayhead}
               style={{
@@ -889,28 +1556,87 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                 fontSize: '12px',
                 cursor: 'pointer',
               }}
-              title="Split Clip at Playhead (C)"
+              title="Split Clip at Playhead (Cmd+B)"
             >
               <Scissors size={13} />
               Split
             </button>
 
             {selectedClip && (
-              <button
-                onClick={handleDeleteSelected}
-                style={{
-                  background: '#1C1C22',
-                  border: '1px solid #3F1D24',
-                  color: '#F87171',
-                  borderRadius: '6px',
-                  padding: '4px 10px',
-                  fontSize: '12px',
-                  cursor: 'pointer',
-                }}
-              >
-                Delete Clip
-              </button>
+              <>
+                <button
+                  onClick={handleDuplicateSelected}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    background: '#1C1C22',
+                    border: '1px solid #282834',
+                    color: '#FFFFFF',
+                    borderRadius: '6px',
+                    padding: '4px 10px',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                  }}
+                  title="Duplicate Clip (Cmd+D)"
+                >
+                  <Copy size={13} />
+                  Duplicate
+                </button>
+
+                <button
+                  onClick={handleRippleDeleteSelected}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    background: '#1C1C22',
+                    border: '1px solid #3F1D24',
+                    color: '#F87171',
+                    borderRadius: '6px',
+                    padding: '4px 10px',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                  }}
+                  title="Ripple Delete (Shift+Backspace)"
+                >
+                  <Trash2 size={13} />
+                  Ripple Del
+                </button>
+              </>
             )}
+
+            {/* Add Track Dropdown / Button */}
+            <button
+              onClick={() => globalStore.dispatch(new AddTrackCommand('video'))}
+              style={{
+                background: '#1C1C22',
+                border: '1px solid #282834',
+                color: '#94A3B8',
+                borderRadius: '6px',
+                padding: '4px 8px',
+                fontSize: '11px',
+                cursor: 'pointer',
+              }}
+              title="Add Video Track"
+            >
+              + Video Track
+            </button>
+            <button
+              onClick={() => globalStore.dispatch(new AddTrackCommand('audio'))}
+              style={{
+                background: '#1C1C22',
+                border: '1px solid #282834',
+                color: '#94A3B8',
+                borderRadius: '6px',
+                padding: '4px 8px',
+                fontSize: '11px',
+                cursor: 'pointer',
+              }}
+              title="Add Audio Track"
+            >
+              + Audio Track
+            </button>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -918,7 +1644,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
             <input
               type="range"
               min="20"
-              max="100"
+              max="120"
               value={timelineZoom}
               onChange={(e) => setTimelineZoom(Number(e.target.value))}
               style={{ width: '80px', accentColor: '#E2F952' }}
@@ -930,9 +1656,8 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
         <div
           ref={timelineScrollRef}
           onClick={(e) => {
-            // Seek playhead by clicking on timeline
             const rect = e.currentTarget.getBoundingClientRect();
-            const clickX = e.clientX - rect.left - 180; // 180px track header offset
+            const clickX = e.clientX - rect.left - 180 + (timelineScrollRef.current?.scrollLeft || 0);
             if (clickX >= 0) {
               const clickedTime = clickX / timelineZoom;
               handleSeek(clickedTime);
@@ -991,7 +1716,27 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
           </div>
 
           {/* Tracks Area */}
-          <div style={{ position: 'relative', width: `${180 + project.settings.duration * timelineZoom}px`, flex: 1 }}>
+          <div
+            ref={tracksContainerRef}
+            style={{ position: 'relative', width: `${180 + project.settings.duration * timelineZoom}px`, flex: 1 }}
+          >
+            {/* Visual Snap Guide Line */}
+            {snapLineTime !== null && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  bottom: 0,
+                  left: `${180 + snapLineTime * timelineZoom}px`,
+                  width: '1px',
+                  backgroundColor: '#E2F952',
+                  boxShadow: '0 0 8px #E2F952',
+                  zIndex: 25,
+                  pointerEvents: 'none',
+                }}
+              />
+            )}
+
             {/* Draggable Playhead Marker */}
             <div
               style={{
@@ -1036,6 +1781,72 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
               return (
                 <div
                   key={track.id}
+                  data-track-id={track.id}
+                  data-track-type={track.type}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'copy';
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const assetId = e.dataTransfer.getData('text/plain');
+                    const asset = project.assets[assetId];
+                    if (asset) {
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const dropX = e.clientX - rect.left - 180 + (timelineScrollRef.current?.scrollLeft || 0);
+                      const dropTime = Math.max(0, dropX / timelineZoom);
+
+                      const newClip: Clip = asset.type === 'audio'
+                        ? {
+                            id: `clip_${Date.now()}`,
+                            name: asset.name,
+                            type: 'audio',
+                            assetId: asset.id,
+                            start: dropTime,
+                            duration: asset.duration || 10,
+                            in: 0,
+                            out: asset.duration || 10,
+                            speed: 1,
+                            opacity: 1,
+                            locked: false,
+                            volume: 0.8,
+                            fadeIn: 0,
+                            fadeOut: 0,
+                            keyframes: {},
+                            effects: [],
+                            transform: {
+                              position: { x: 0, y: 0 },
+                              scale: { x: 1, y: 1 },
+                              rotation: 0,
+                              anchor: { x: 0.5, y: 0.5 },
+                            },
+                          }
+                        : {
+                            id: `clip_${Date.now()}`,
+                            name: asset.name,
+                            type: 'video',
+                            assetId: asset.id,
+                            start: dropTime,
+                            duration: asset.duration || 6,
+                            in: 0,
+                            out: asset.duration || 6,
+                            speed: 1,
+                            opacity: 1,
+                            locked: false,
+                            keyframes: {},
+                            effects: [],
+                            transform: {
+                              position: { x: 0, y: 0 },
+                              scale: { x: 1, y: 1 },
+                              rotation: 0,
+                              anchor: { x: 0.5, y: 0.5 },
+                            },
+                          };
+
+                      globalStore.dispatch(new AddClipCommand(track.id, newClip));
+                      globalSelection.select({ type: 'clip', id: newClip.id });
+                    }
+                  }}
                   style={{
                     height: isAudio ? '48px' : '56px',
                     borderBottom: '1px solid #1E1E26',
@@ -1072,8 +1883,28 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#64748B' }}>
-                      {track.visible ? <Eye size={13} /> : <EyeOff size={13} />}
-                      {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
+                      <span
+                        onClick={() => {
+                          const updated = project.timeline.tracks.map((t) =>
+                            t.id === track.id ? { ...t, visible: !t.visible } : t
+                          );
+                          globalStore.dispatch(new SetClipPropertyCommand('root', 'timeline.tracks', updated));
+                        }}
+                        style={{ cursor: 'pointer' }}
+                      >
+                        {track.visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                      </span>
+                      <span
+                        onClick={() => {
+                          const updated = project.timeline.tracks.map((t) =>
+                            t.id === track.id ? { ...t, locked: !t.locked } : t
+                          );
+                          globalStore.dispatch(new SetClipPropertyCommand('root', 'timeline.tracks', updated));
+                        }}
+                        style={{ cursor: 'pointer' }}
+                      >
+                        {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
+                      </span>
                     </div>
                   </div>
 
@@ -1081,10 +1912,20 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                   <div style={{ flex: 1, position: 'relative', height: '100%' }}>
                     {track.clips.map((clip) => {
                       const isSelected = selection.type === 'clip' && selection.id === clip.id;
-                      const clipLeft = clip.start * timelineZoom;
-                      const clipWidth = clip.duration * timelineZoom;
+                      const isBeingDragged = dragState?.clipId === clip.id;
+                      const isBeingTrimmed = trimState?.clipId === clip.id;
 
-                      // Theme colors based on clip type
+                      const activeStart = isBeingDragged
+                        ? dragState.currentStart
+                        : isBeingTrimmed
+                        ? trimState.currentStart
+                        : clip.start;
+
+                      const activeDuration = isBeingTrimmed ? trimState.currentDuration : clip.duration;
+
+                      const clipLeft = activeStart * timelineZoom;
+                      const clipWidth = Math.max(10, activeDuration * timelineZoom);
+
                       const isMotion = clip.type === 'motionComposition';
                       const isText = clip.type === 'text';
                       const isAud = clip.type === 'audio';
@@ -1102,9 +1943,53 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                       return (
                         <div
                           key={clip.id}
-                          onClick={(e) => {
+                          onPointerDown={(e) => {
                             e.stopPropagation();
                             globalSelection.select({ type: 'clip', id: clip.id });
+
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const clickOffset = e.clientX - rect.left;
+
+                            // Left trim handle (first 10px)
+                            if (clickOffset <= 10) {
+                              setTrimState({
+                                clipId: clip.id,
+                                handle: 'left',
+                                startX: e.clientX,
+                                originalStart: clip.start,
+                                originalDuration: clip.duration,
+                                originalIn: clip.in,
+                                originalOut: clip.out,
+                                currentStart: clip.start,
+                                currentDuration: clip.duration,
+                              });
+                            }
+                            // Right trim handle (last 10px)
+                            else if (clickOffset >= rect.width - 10) {
+                              setTrimState({
+                                clipId: clip.id,
+                                handle: 'right',
+                                startX: e.clientX,
+                                originalStart: clip.start,
+                                originalDuration: clip.duration,
+                                originalIn: clip.in,
+                                originalOut: clip.out,
+                                currentStart: clip.start,
+                                currentDuration: clip.duration,
+                              });
+                            }
+                            // Body drag
+                            else {
+                              setDragState({
+                                clipId: clip.id,
+                                originalStart: clip.start,
+                                originalTrackId: track.id,
+                                startX: e.clientX,
+                                startY: e.clientY,
+                                currentStart: clip.start,
+                                targetTrackId: track.id,
+                              });
+                            }
                           }}
                           onDoubleClick={(e) => {
                             e.stopPropagation();
@@ -1122,15 +2007,44 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                             borderRadius: '6px',
                             border: `2px solid ${isSelected ? '#E2F952' : borderColor}`,
                             boxShadow: isSelected ? '0 0 12px rgba(226, 249, 82, 0.4)' : 'none',
-                            cursor: 'pointer',
+                            cursor: 'grab',
                             display: 'flex',
                             flexDirection: 'column',
                             justifyContent: 'space-between',
                             padding: '4px 8px',
                             overflow: 'hidden',
-                            userSelect: 'none',
+                            opacity: isBeingDragged ? 0.75 : 1,
+                            zIndex: isSelected || isBeingDragged ? 20 : 5,
                           }}
                         >
+                          {/* Left Trim Handle Visual */}
+                          <div
+                            style={{
+                              position: 'absolute',
+                              left: 0,
+                              top: 0,
+                              bottom: 0,
+                              width: '8px',
+                              cursor: 'col-resize',
+                              backgroundColor: 'rgba(255,255,255,0.08)',
+                            }}
+                            title="Trim Start"
+                          />
+
+                          {/* Right Trim Handle Visual */}
+                          <div
+                            style={{
+                              position: 'absolute',
+                              right: 0,
+                              top: 0,
+                              bottom: 0,
+                              width: '8px',
+                              cursor: 'col-resize',
+                              backgroundColor: 'rgba(255,255,255,0.08)',
+                            }}
+                            title="Trim End"
+                          />
+
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <span style={{ fontSize: '11px', fontWeight: 600, color: '#FFFFFF', whiteSpace: 'nowrap' }}>
                               {clip.name}
@@ -1145,7 +2059,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onNavigate, onOp
                           {/* Audio Waveform visualization */}
                           {isAud && (
                             <div style={{ display: 'flex', alignItems: 'center', height: '18px', gap: '2px', opacity: 0.8 }}>
-                              {Array.from({ length: Math.min(60, Math.floor(clipWidth / 4)) }).map((_, idx) => {
+                              {Array.from({ length: Math.min(80, Math.floor(clipWidth / 4)) }).map((_, idx) => {
                                 const h = 30 + Math.sin(idx * 0.4) * 50;
                                 return (
                                   <div

@@ -101,6 +101,7 @@ export class ToolDispatcher {
               opacity: 1,
               locked: false,
               keyframes: {},
+              effects: [],
               transform: {
                 position: { x: 0, y: 0 },
                 scale: { x: 1, y: 1 },

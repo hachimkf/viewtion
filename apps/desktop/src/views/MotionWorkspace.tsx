@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import {
   Layers,
   Sparkles,
@@ -19,6 +19,10 @@ import {
   ChevronDown,
   ArrowLeft,
   Grid,
+  Trash2,
+  Copy,
+  Timer,
+  Wand2,
 } from 'lucide-react';
 import {
   ActiveWorkspace,
@@ -31,13 +35,14 @@ import {
   AddLayerCommand,
   SetLayerPropertyCommand,
   AddKeyframeCommand,
+  RemoveKeyframeCommand,
 } from '@viewtion/editor-core';
 import {
   renderMotionCompositionToCanvas,
   evaluateLayerAtTime,
   evaluateEasing,
+  solveCubicBezier,
 } from '@viewtion/motion-engine';
-import { formatTimecodeDetailed } from '@viewtion/video-engine';
 import {
   MotionComposition,
   MotionLayer,
@@ -73,8 +78,32 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
   const [localTime, setLocalTime] = useState(2.5); // seconds
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedLayerId, setSelectedLayerId] = useState<string>('layer_text_01');
-  const [inspectorTab, setInspectorTab] = useState<'transform' | 'text' | 'effects'>('transform');
+  const [inspectorTab, setInspectorTab] = useState<'transform' | 'text' | 'presets'>('transform');
   const [showCurveEditor, setShowCurveEditor] = useState(true);
+
+  // Active keyframe property for graph editor
+  const [activeGraphProp, setActiveGraphProp] = useState<string>('scale.x');
+
+  // Interactive Gizmo dragging state
+  const [gizmoDrag, setGizmoDrag] = useState<{
+    mode: 'move' | 'scale' | 'rotate';
+    startX: number;
+    startY: number;
+    initialPos: { x: number; y: number };
+    initialScale: { x: number; y: number };
+    initialRot: number;
+  } | null>(null);
+
+  // Selected keyframe for dragging/deleting
+  const [selectedKf, setSelectedKf] = useState<{ layerId: string; prop: string; kfId: string } | null>(null);
+
+  // Bezier curve handle state
+  const [bezierHandles, setBezierHandles] = useState<{ p1x: number; p1y: number; p2x: number; p2y: number }>({
+    p1x: 0.25,
+    p1y: 0.1,
+    p2x: 0.25,
+    p2y: 1.0,
+  });
 
   // Set default selected layer if exists
   useEffect(() => {
@@ -121,13 +150,80 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
   }, [isPlaying, comp.duration]);
 
   const activeLayer = comp.layers.find((l) => l.id === selectedLayerId);
+  const evaluatedActive = activeLayer ? evaluateLayerAtTime(activeLayer, localTime) : null;
+
+  // Gizmo dragging handlers
+  useEffect(() => {
+    const handlePointerMove = (e: PointerEvent) => {
+      if (!gizmoDrag || !activeLayer) return;
+
+      const dx = e.clientX - gizmoDrag.startX;
+      const dy = e.clientY - gizmoDrag.startY;
+
+      // Scale factor from preview viewport (320px width represents 1080px canvas)
+      const scaleFactor = comp.width / 320;
+
+      if (gizmoDrag.mode === 'move') {
+        const newX = Math.round(gizmoDrag.initialPos.x + dx * scaleFactor);
+        const newY = Math.round(gizmoDrag.initialPos.y + dy * scaleFactor);
+        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.position.x', newX));
+        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.position.y', newY));
+      } else if (gizmoDrag.mode === 'scale') {
+        const factor = 1 + (dx + dy) / 200;
+        const newScaleX = Math.max(0.1, Number((gizmoDrag.initialScale.x * factor).toFixed(2)));
+        const newScaleY = Math.max(0.1, Number((gizmoDrag.initialScale.y * factor).toFixed(2)));
+        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.scale.x', newScaleX));
+        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.scale.y', newScaleY));
+      } else if (gizmoDrag.mode === 'rotate') {
+        const newRot = Math.round(gizmoDrag.initialRot + dx * 0.5);
+        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.rotation', newRot));
+      }
+    };
+
+    const handlePointerUp = () => {
+      setGizmoDrag(null);
+    };
+
+    if (gizmoDrag) {
+      window.addEventListener('pointermove', handlePointerMove);
+      window.addEventListener('pointerup', handlePointerUp);
+    }
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [gizmoDrag, activeLayer, comp]);
+
+  // Keyboard shortcut listener for Motion workspace
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
+
+      if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        setIsPlaying(!isPlaying);
+      } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        if (selectedKf) {
+          e.preventDefault();
+          globalStore.dispatch(
+            new RemoveKeyframeCommand(comp.id, selectedKf.layerId, selectedKf.prop, selectedKf.kfId)
+          );
+          setSelectedKf(null);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isPlaying, selectedKf, comp.id]);
 
   const handleAddTextLayer = () => {
     const newText: MotionTextLayer = {
       id: `layer_text_${Date.now()}`,
       name: `Text ${comp.layers.length + 1}`,
       type: 'text',
-      text: 'New Kinetic Title',
+      text: 'Kinetic Motion',
       fontSize: 54,
       fontFamily: 'Inter, sans-serif',
       fill: '#FFFFFF',
@@ -135,6 +231,7 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
       duration: comp.duration,
       visible: true,
       locked: false,
+      keyframes: {},
       transform: {
         position: { x: comp.width / 2, y: comp.height / 2 },
         scale: { x: 1, y: 1 },
@@ -143,7 +240,6 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
       },
       opacity: 1,
       blending: 'normal',
-      keyframes: {},
     };
     globalStore.dispatch(new AddLayerCommand(comp.id, newText));
     setSelectedLayerId(newText.id);
@@ -163,6 +259,7 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
       duration: comp.duration,
       visible: true,
       locked: false,
+      keyframes: {},
       transform: {
         position: { x: comp.width / 2, y: comp.height / 2 },
         scale: { x: 1, y: 1 },
@@ -171,19 +268,19 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
       },
       opacity: 1,
       blending: 'normal',
-      keyframes: {},
     };
     globalStore.dispatch(new AddLayerCommand(comp.id, newShape));
     setSelectedLayerId(newShape.id);
   };
 
-  const handleAddKeyframe = (prop: string) => {
+  const handleToggleKeyframe = (prop: string) => {
     if (!activeLayer) return;
     const evaluated = evaluateLayerAtTime(activeLayer, localTime);
     let val: any = 0;
     if (prop === 'opacity') val = evaluated.opacity;
     if (prop === 'rotation') val = evaluated.rotation;
     if (prop === 'scale.x') val = evaluated.scale.x;
+    if (prop === 'position.y') val = evaluated.position.y;
 
     const kf: Keyframe = {
       id: `kf_${Date.now()}`,
@@ -192,6 +289,63 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
       easing: 'easeInOut',
     };
     globalStore.dispatch(new AddKeyframeCommand(comp.id, activeLayer.id, prop, kf));
+  };
+
+  // Preset Applicator
+  const handleApplyPreset = (presetName: string) => {
+    if (!activeLayer) return;
+
+    if (presetName === 'pop') {
+      globalStore.dispatch(
+        new AddKeyframeCommand(comp.id, activeLayer.id, 'scale.x', {
+          id: `kf_${Date.now()}_1`,
+          time: 0,
+          value: 0.4,
+          easing: 'elastic',
+        })
+      );
+      globalStore.dispatch(
+        new AddKeyframeCommand(comp.id, activeLayer.id, 'scale.x', {
+          id: `kf_${Date.now()}_2`,
+          time: 1.2,
+          value: 1.0,
+          easing: 'elastic',
+        })
+      );
+    } else if (presetName === 'fadeUp') {
+      globalStore.dispatch(
+        new AddKeyframeCommand(comp.id, activeLayer.id, 'opacity', {
+          id: `kf_${Date.now()}_1`,
+          time: 0,
+          value: 0,
+          easing: 'easeOut',
+        })
+      );
+      globalStore.dispatch(
+        new AddKeyframeCommand(comp.id, activeLayer.id, 'opacity', {
+          id: `kf_${Date.now()}_2`,
+          time: 1.0,
+          value: 1,
+          easing: 'easeOut',
+        })
+      );
+      globalStore.dispatch(
+        new AddKeyframeCommand(comp.id, activeLayer.id, 'position.y', {
+          id: `kf_${Date.now()}_3`,
+          time: 0,
+          value: activeLayer.transform.position.y + 80,
+          easing: 'easeOut',
+        })
+      );
+      globalStore.dispatch(
+        new AddKeyframeCommand(comp.id, activeLayer.id, 'position.y', {
+          id: `kf_${Date.now()}_4`,
+          time: 1.0,
+          value: activeLayer.transform.position.y,
+          easing: 'easeOut',
+        })
+      );
+    }
   };
 
   return (
@@ -359,7 +513,6 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
             {comp.layers.map((layer) => {
               const isSelected = selectedLayerId === layer.id;
               const isText = layer.type === 'text';
-              const isShape = layer.type === 'shape';
 
               return (
                 <div
@@ -394,7 +547,7 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
           </div>
         </div>
 
-        {/* Center: Canvas Viewport */}
+        {/* Center: Canvas Viewport with Interactive Gizmo */}
         <div
           style={{
             flex: 1,
@@ -407,7 +560,7 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
             overflow: 'hidden',
           }}
         >
-          {/* Motion Canvas Container (with bounding box) */}
+          {/* Motion Canvas Container */}
           <div
             style={{
               position: 'relative',
@@ -430,24 +583,117 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
               }}
             />
 
-            {/* Bounding box guide overlay for active layer */}
-            {activeLayer && (
+            {/* Interactive Bounding Box Gizmo for Active Layer */}
+            {activeLayer && evaluatedActive && (
               <div
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  setGizmoDrag({
+                    mode: 'move',
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    initialPos: { ...activeLayer.transform.position },
+                    initialScale: { ...activeLayer.transform.scale },
+                    initialRot: activeLayer.transform.rotation,
+                  });
+                }}
                 style={{
                   position: 'absolute',
-                  top: '25%',
-                  left: '15%',
-                  width: '70%',
-                  height: '50%',
-                  border: '1px dashed #E2F952',
-                  pointerEvents: 'none',
+                  left: `${(evaluatedActive.position.x / comp.width) * 100}%`,
+                  top: `${(evaluatedActive.position.y / comp.height) * 100}%`,
+                  width: '120px',
+                  height: '80px',
+                  transform: `translate(-50%, -50%) rotate(${evaluatedActive.rotation}deg) scale(${evaluatedActive.scale.x}, ${evaluatedActive.scale.y})`,
+                  border: '1.5px solid #E2F952',
+                  boxShadow: '0 0 10px rgba(226, 249, 82, 0.3)',
+                  cursor: 'grab',
                 }}
+                title="Drag to reposition layer"
               >
-                {/* 4 corner transform handles */}
-                <div style={{ position: 'absolute', top: '-4px', left: '-4px', width: '8px', height: '8px', backgroundColor: '#E2F952' }} />
-                <div style={{ position: 'absolute', top: '-4px', right: '-4px', width: '8px', height: '8px', backgroundColor: '#E2F952' }} />
-                <div style={{ position: 'absolute', bottom: '-4px', left: '-4px', width: '8px', height: '8px', backgroundColor: '#E2F952' }} />
-                <div style={{ position: 'absolute', bottom: '-4px', right: '-4px', width: '8px', height: '8px', backgroundColor: '#E2F952' }} />
+                {/* 4 Corner Resize Handles */}
+                <div
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setGizmoDrag({
+                      mode: 'scale',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      initialPos: { ...activeLayer.transform.position },
+                      initialScale: { ...activeLayer.transform.scale },
+                      initialRot: activeLayer.transform.rotation,
+                    });
+                  }}
+                  style={{ position: 'absolute', top: '-5px', left: '-5px', width: '10px', height: '10px', backgroundColor: '#E2F952', borderRadius: '2px', cursor: 'nwse-resize' }}
+                />
+                <div
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setGizmoDrag({
+                      mode: 'scale',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      initialPos: { ...activeLayer.transform.position },
+                      initialScale: { ...activeLayer.transform.scale },
+                      initialRot: activeLayer.transform.rotation,
+                    });
+                  }}
+                  style={{ position: 'absolute', top: '-5px', right: '-5px', width: '10px', height: '10px', backgroundColor: '#E2F952', borderRadius: '2px', cursor: 'nesw-resize' }}
+                />
+                <div
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setGizmoDrag({
+                      mode: 'scale',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      initialPos: { ...activeLayer.transform.position },
+                      initialScale: { ...activeLayer.transform.scale },
+                      initialRot: activeLayer.transform.rotation,
+                    });
+                  }}
+                  style={{ position: 'absolute', bottom: '-5px', left: '-5px', width: '10px', height: '10px', backgroundColor: '#E2F952', borderRadius: '2px', cursor: 'nesw-resize' }}
+                />
+                <div
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setGizmoDrag({
+                      mode: 'scale',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      initialPos: { ...activeLayer.transform.position },
+                      initialScale: { ...activeLayer.transform.scale },
+                      initialRot: activeLayer.transform.rotation,
+                    });
+                  }}
+                  style={{ position: 'absolute', bottom: '-5px', right: '-5px', width: '10px', height: '10px', backgroundColor: '#E2F952', borderRadius: '2px', cursor: 'nwse-resize' }}
+                />
+
+                {/* Top Rotation Handle */}
+                <div
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setGizmoDrag({
+                      mode: 'rotate',
+                      startX: e.clientX,
+                      startY: e.clientY,
+                      initialPos: { ...activeLayer.transform.position },
+                      initialScale: { ...activeLayer.transform.scale },
+                      initialRot: activeLayer.transform.rotation,
+                    });
+                  }}
+                  style={{
+                    position: 'absolute',
+                    top: '-20px',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    width: '8px',
+                    height: '8px',
+                    backgroundColor: '#9D7BFF',
+                    borderRadius: '50%',
+                    cursor: 'crosshair',
+                  }}
+                  title="Drag horizontally to rotate"
+                />
               </div>
             )}
           </div>
@@ -497,197 +743,166 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
               Text
             </span>
             <span
-              onClick={() => setInspectorTab('effects')}
+              onClick={() => setInspectorTab('presets')}
               style={{
                 fontSize: '12px',
                 fontWeight: 600,
-                color: inspectorTab === 'effects' ? '#E2F952' : '#64748B',
+                color: inspectorTab === 'presets' ? '#E2F952' : '#64748B',
                 cursor: 'pointer',
               }}
             >
-              Effects
+              Presets
             </span>
           </div>
 
           {/* Inspector Controls */}
           {activeLayer ? (
             <div style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              {/* Position */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
-                <span style={{ color: '#94A3B8' }}>Position</span>
-                <div style={{ display: 'flex', gap: '6px' }}>
-                  <input
-                    type="number"
-                    value={activeLayer.transform.position.x}
-                    onChange={(e) =>
-                      globalStore.dispatch(
-                        new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.position.x', Number(e.target.value))
-                      )
-                    }
-                    style={{
-                      width: '60px',
-                      backgroundColor: '#1C1C22',
-                      border: '1px solid #2E2E38',
-                      color: '#FFF',
-                      borderRadius: '4px',
-                      padding: '4px 6px',
-                      fontSize: '11px',
-                    }}
-                  />
-                  <input
-                    type="number"
-                    value={activeLayer.transform.position.y}
-                    onChange={(e) =>
-                      globalStore.dispatch(
-                        new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.position.y', Number(e.target.value))
-                      )
-                    }
-                    style={{
-                      width: '60px',
-                      backgroundColor: '#1C1C22',
-                      border: '1px solid #2E2E38',
-                      color: '#FFF',
-                      borderRadius: '4px',
-                      padding: '4px 6px',
-                      fontSize: '11px',
-                    }}
-                  />
-                </div>
-              </div>
+              {inspectorTab === 'transform' && (
+                <>
+                  {/* Position */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span style={{ color: '#94A3B8' }}>Position</span>
+                      <button
+                        onClick={() => handleToggleKeyframe('position.y')}
+                        style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer' }}
+                        title="Keyframe Position"
+                      >
+                        <Timer size={12} />
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <input
+                        type="number"
+                        value={activeLayer.transform.position.x}
+                        onChange={(e) =>
+                          globalStore.dispatch(
+                            new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.position.x', Number(e.target.value))
+                          )
+                        }
+                        style={{ width: '56px', backgroundColor: '#1C1C22', border: '1px solid #2E2E38', color: '#FFF', borderRadius: '4px', padding: '3px 6px', fontSize: '11px' }}
+                      />
+                      <input
+                        type="number"
+                        value={activeLayer.transform.position.y}
+                        onChange={(e) =>
+                          globalStore.dispatch(
+                            new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.position.y', Number(e.target.value))
+                          )
+                        }
+                        style={{ width: '56px', backgroundColor: '#1C1C22', border: '1px solid #2E2E38', color: '#FFF', borderRadius: '4px', padding: '3px 6px', fontSize: '11px' }}
+                      />
+                    </div>
+                  </div>
 
-              {/* Scale */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
-                <span style={{ color: '#94A3B8' }}>Scale</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <input
-                    type="number"
-                    step="0.1"
-                    value={activeLayer.transform.scale.x}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.scale.x', v));
-                      globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.scale.y', v));
-                    }}
-                    style={{
-                      width: '60px',
-                      backgroundColor: '#1C1C22',
-                      border: '1px solid #2E2E38',
-                      color: '#FFF',
-                      borderRadius: '4px',
-                      padding: '4px 6px',
-                      fontSize: '11px',
-                    }}
-                  />
-                  <button
-                    onClick={() => handleAddKeyframe('scale.x')}
-                    style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer', fontSize: '10px' }}
-                    title="Add Keyframe"
-                  >
-                    ◆
-                  </button>
-                </div>
-              </div>
+                  {/* Scale */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span style={{ color: '#94A3B8' }}>Scale</span>
+                      <button
+                        onClick={() => handleToggleKeyframe('scale.x')}
+                        style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer' }}
+                        title="Keyframe Scale"
+                      >
+                        <Timer size={12} />
+                      </button>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.1"
+                      max="3"
+                      step="0.05"
+                      value={activeLayer.transform.scale.x}
+                      onChange={(e) => {
+                        const s = Number(e.target.value);
+                        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.scale.x', s));
+                        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.scale.y', s));
+                      }}
+                      style={{ width: '100px', accentColor: '#E2F952' }}
+                    />
+                  </div>
 
-              {/* Rotation */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
-                <span style={{ color: '#94A3B8' }}>Rotation</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <input
-                    type="number"
-                    value={activeLayer.transform.rotation}
-                    onChange={(e) =>
-                      globalStore.dispatch(
-                        new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.rotation', Number(e.target.value))
-                      )
-                    }
-                    style={{
-                      width: '60px',
-                      backgroundColor: '#1C1C22',
-                      border: '1px solid #2E2E38',
-                      color: '#FFF',
-                      borderRadius: '4px',
-                      padding: '4px 6px',
-                      fontSize: '11px',
-                    }}
-                  />
-                  <button
-                    onClick={() => handleAddKeyframe('rotation')}
-                    style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer', fontSize: '10px' }}
-                    title="Add Keyframe"
-                  >
-                    ◆
-                  </button>
-                </div>
-              </div>
+                  {/* Rotation */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span style={{ color: '#94A3B8' }}>Rotation</span>
+                      <button
+                        onClick={() => handleToggleKeyframe('rotation')}
+                        style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer' }}
+                        title="Keyframe Rotation"
+                      >
+                        <Timer size={12} />
+                      </button>
+                    </div>
+                    <input
+                      type="number"
+                      value={activeLayer.transform.rotation}
+                      onChange={(e) =>
+                        globalStore.dispatch(
+                          new SetLayerPropertyCommand(comp.id, activeLayer.id, 'transform.rotation', Number(e.target.value))
+                        )
+                      }
+                      style={{ width: '56px', backgroundColor: '#1C1C22', border: '1px solid #2E2E38', color: '#FFF', borderRadius: '4px', padding: '3px 6px', fontSize: '11px' }}
+                    />
+                  </div>
 
-              {/* Opacity */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
-                <span style={{ color: '#94A3B8' }}>Opacity</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={activeLayer.opacity}
-                    onChange={(e) =>
-                      globalStore.dispatch(
-                        new SetLayerPropertyCommand(comp.id, activeLayer.id, 'opacity', Number(e.target.value))
-                      )
-                    }
-                    style={{ width: '80px', accentColor: '#E2F952' }}
-                  />
-                  <button
-                    onClick={() => handleAddKeyframe('opacity')}
-                    style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer', fontSize: '10px' }}
-                    title="Add Keyframe"
-                  >
-                    ◆
-                  </button>
-                </div>
-              </div>
+                  {/* Opacity */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span style={{ color: '#94A3B8' }}>Opacity</span>
+                      <button
+                        onClick={() => handleToggleKeyframe('opacity')}
+                        style={{ background: 'none', border: 'none', color: '#9D7BFF', cursor: 'pointer' }}
+                        title="Keyframe Opacity"
+                      >
+                        <Timer size={12} />
+                      </button>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={activeLayer.opacity}
+                      onChange={(e) =>
+                        globalStore.dispatch(
+                          new SetLayerPropertyCommand(comp.id, activeLayer.id, 'opacity', Number(e.target.value))
+                        )
+                      }
+                      style={{ width: '100px', accentColor: '#E2F952' }}
+                    />
+                  </div>
 
-              <div style={{ height: '1px', backgroundColor: '#26262E', margin: '4px 0' }} />
+                  <div style={{ height: '1px', backgroundColor: '#26262E', margin: '4px 0' }} />
 
-              {/* Fill styling */}
-              <div style={{ fontSize: '12px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                  <span style={{ color: '#94A3B8' }}>Fill Color</span>
-                  <input
-                    type="color"
-                    value={
-                      activeLayer.type === 'shape'
-                        ? (activeLayer as ShapeLayer).fill
-                        : (activeLayer as MotionTextLayer).fill || '#FFFFFF'
-                    }
-                    onChange={(e) =>
-                      globalStore.dispatch(
-                        new SetLayerPropertyCommand(comp.id, activeLayer.id, 'fill', e.target.value)
-                      )
-                    }
-                    style={{
-                      width: '24px',
-                      height: '24px',
-                      borderRadius: '4px',
-                      border: 'none',
-                      cursor: 'pointer',
-                      background: 'none',
-                    }}
-                  />
-                </div>
-              </div>
+                  {/* Fill Color */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                    <span style={{ color: '#94A3B8' }}>Fill Color</span>
+                    <input
+                      type="color"
+                      value={
+                        activeLayer.type === 'shape'
+                          ? (activeLayer as ShapeLayer).fill
+                          : (activeLayer as MotionTextLayer).fill || '#FFFFFF'
+                      }
+                      onChange={(e) =>
+                        globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'fill', e.target.value))
+                      }
+                      style={{ width: '26px', height: '26px', borderRadius: '4px', border: 'none', cursor: 'pointer', background: 'none' }}
+                    />
+                  </div>
+                </>
+              )}
 
-              {/* Text editing if text layer */}
-              {activeLayer.type === 'text' && (
+              {inspectorTab === 'text' && activeLayer.type === 'text' && (
                 <div style={{ fontSize: '12px' }}>
                   <span style={{ color: '#94A3B8', display: 'block', marginBottom: '6px' }}>Text Content</span>
                   <textarea
-                    rows={3}
+                    rows={4}
                     value={(activeLayer as MotionTextLayer).text}
                     onChange={(e) =>
-                      globalStore.dispatch(
-                        new SetLayerPropertyCommand(comp.id, activeLayer.id, 'text', e.target.value)
-                      )
+                      globalStore.dispatch(new SetLayerPropertyCommand(comp.id, activeLayer.id, 'text', e.target.value))
                     }
                     style={{
                       width: '100%',
@@ -695,11 +910,47 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
                       border: '1px solid #2E2E38',
                       color: '#FFF',
                       borderRadius: '6px',
-                      padding: '6px 8px',
+                      padding: '8px',
                       fontSize: '12px',
                       resize: 'none',
                     }}
                   />
+                </div>
+              )}
+
+              {inspectorTab === 'presets' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <span style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 600 }}>ANIMATION PRESETS</span>
+                  <button
+                    onClick={() => handleApplyPreset('pop')}
+                    style={{
+                      backgroundColor: '#1C1C22',
+                      border: '1px solid #2E2E38',
+                      borderRadius: '6px',
+                      padding: '8px 12px',
+                      color: '#FFFFFF',
+                      fontSize: '12px',
+                      textAlign: 'left',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    ✨ Pop & Elastic Scale
+                  </button>
+                  <button
+                    onClick={() => handleApplyPreset('fadeUp')}
+                    style={{
+                      backgroundColor: '#1C1C22',
+                      border: '1px solid #2E2E38',
+                      borderRadius: '6px',
+                      padding: '8px 12px',
+                      color: '#FFFFFF',
+                      fontSize: '12px',
+                      textAlign: 'left',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    🚀 Smooth Fade Up Reveal
+                  </button>
                 </div>
               )}
             </div>
@@ -733,23 +984,48 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
             padding: '0 16px',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             <span style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>ANIMATION TIMELINE</span>
+            {selectedKf && (
+              <span style={{ fontSize: '11px', color: '#E2F952' }}>
+                Keyframe selected • Press Backspace to delete
+              </span>
+            )}
           </div>
 
-          <button
-            onClick={() => setShowCurveEditor(!showCurveEditor)}
-            style={{
-              background: 'transparent',
-              border: 'none',
-              color: showCurveEditor ? '#E2F952' : '#64748B',
-              fontSize: '11px',
-              fontWeight: 500,
-              cursor: 'pointer',
-            }}
-          >
-            {showCurveEditor ? 'Hide Graph Editor' : 'Show Graph Editor'}
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <select
+              value={activeGraphProp}
+              onChange={(e) => setActiveGraphProp(e.target.value)}
+              style={{
+                backgroundColor: '#1C1C22',
+                border: '1px solid #2E2E38',
+                color: '#CBD5E1',
+                borderRadius: '4px',
+                padding: '2px 6px',
+                fontSize: '11px',
+              }}
+            >
+              <option value="scale.x">Curve: Scale</option>
+              <option value="opacity">Curve: Opacity</option>
+              <option value="rotation">Curve: Rotation</option>
+              <option value="position.y">Curve: Position Y</option>
+            </select>
+
+            <button
+              onClick={() => setShowCurveEditor(!showCurveEditor)}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: showCurveEditor ? '#E2F952' : '#64748B',
+                fontSize: '11px',
+                fontWeight: 500,
+                cursor: 'pointer',
+              }}
+            >
+              {showCurveEditor ? 'Hide Curve Editor' : 'Show Curve Editor'}
+            </button>
+          </div>
         </div>
 
         {/* Timeline Tracks & Graph Editor Split */}
@@ -778,7 +1054,15 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
                   </div>
 
                   {/* Timeline bar with Keyframe Diamonds */}
-                  <div style={{ flex: 1, height: '100%', position: 'relative', borderLeft: '1px solid #202028' }}>
+                  <div
+                    onClick={(e) => {
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const clickX = e.clientX - rect.left;
+                      const time = Math.max(0, Math.min(comp.duration, (clickX / rect.width) * comp.duration));
+                      setLocalTime(time);
+                    }}
+                    style={{ flex: 1, height: '100%', position: 'relative', borderLeft: '1px solid #202028' }}
+                  >
                     {/* Layer span bar */}
                     <div
                       style={{
@@ -795,23 +1079,32 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
                     {/* Keyframe diamonds */}
                     {kfKeys.flatMap((key) => {
                       const kfs = layer.keyframes?.[key] || [];
-                      return kfs.map((kf) => (
-                        <div
-                          key={kf.id}
-                          style={{
-                            position: 'absolute',
-                            left: `${(kf.time / comp.duration) * 100}%`,
-                            top: '16px',
-                            width: '10px',
-                            height: '10px',
-                            backgroundColor: '#9D7BFF',
-                            transform: 'translate(-5px, -50%) rotate(45deg)',
-                            border: '1px solid #FFFFFF',
-                            zIndex: 10,
-                          }}
-                          title={`Keyframe at ${kf.time}s (${key})`}
-                        />
-                      ));
+                      return kfs.map((kf) => {
+                        const isKfSelected = selectedKf?.kfId === kf.id;
+                        return (
+                          <div
+                            key={kf.id}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedKf({ layerId: layer.id, prop: key, kfId: kf.id });
+                              setLocalTime(kf.time);
+                            }}
+                            style={{
+                              position: 'absolute',
+                              left: `${(kf.time / comp.duration) * 100}%`,
+                              top: '16px',
+                              width: '10px',
+                              height: '10px',
+                              backgroundColor: isKfSelected ? '#E2F952' : '#9D7BFF',
+                              transform: 'translate(-5px, -50%) rotate(45deg)',
+                              border: `1px solid ${isKfSelected ? '#0D0D10' : '#FFFFFF'}`,
+                              zIndex: 15,
+                              cursor: 'pointer',
+                            }}
+                            title={`Keyframe at ${kf.time.toFixed(2)}s (${key})`}
+                          />
+                        );
+                      });
                     })}
                   </div>
                 </div>
@@ -819,39 +1112,70 @@ export const MotionWorkspace: React.FC<MotionWorkspaceProps> = ({ onNavigate, ac
             })}
           </div>
 
-          {/* Bezier Graph / Curve Editor (as shown in Bottom-Left screen) */}
+          {/* Interactive Bezier Graph / Curve Editor */}
           {showCurveEditor && (
             <div style={{ flex: 1, backgroundColor: '#0F0F13', position: 'relative', overflow: 'hidden' }}>
               <div style={{ position: 'absolute', top: '8px', left: '12px', fontSize: '10px', color: '#64748B' }}>
-                BEZIER CURVE EDITOR (Easing: EaseInOut / Elastic)
+                BEZIER CURVE EDITOR ({activeGraphProp.toUpperCase()}) • Drag handles to adjust curve
               </div>
 
-              {/* SVG Smooth Bezier Curve Visualizer matching the screenshot! */}
-              <svg width="100%" height="100%" viewBox="0 0 400 160" preserveAspectRatio="none">
-                {/* Grid lines */}
+              {/* Interactive Bezier SVG Canvas */}
+              <svg
+                width="100%"
+                height="100%"
+                viewBox="0 0 400 160"
+                preserveAspectRatio="none"
+                style={{ cursor: 'crosshair' }}
+              >
+                {/* Horizontal reference lines */}
                 <line x1="0" y1="40" x2="400" y2="40" stroke="#1A1A24" strokeWidth="1" strokeDasharray="4 4" />
                 <line x1="0" y1="80" x2="400" y2="80" stroke="#1A1A24" strokeWidth="1" />
                 <line x1="0" y1="120" x2="400" y2="120" stroke="#1A1A24" strokeWidth="1" strokeDasharray="4 4" />
 
-                {/* Smooth Bezier Motion Curve */}
+                {/* Interactive Curve Path */}
                 <path
-                  d="M 20 130 C 120 130, 160 30, 240 30 C 300 30, 340 100, 380 90"
+                  d={`M 30 130 C ${30 + bezierHandles.p1x * 200} ${130 - bezierHandles.p1y * 100}, ${370 - (1 - bezierHandles.p2x) * 200} ${30 + (1 - bezierHandles.p2y) * 100}, 370 30`}
                   fill="none"
                   stroke="#9D7BFF"
                   strokeWidth="3"
                 />
 
-                {/* Bezier Control Handles */}
-                <line x1="20" y1="130" x2="120" y2="130" stroke="#E2F952" strokeWidth="1" />
-                <circle cx="120" cy="130" r="4" fill="#E2F952" />
+                {/* Handle lines */}
+                <line
+                  x1="30"
+                  y1="130"
+                  x2={30 + bezierHandles.p1x * 200}
+                  y2={130 - bezierHandles.p1y * 100}
+                  stroke="#E2F952"
+                  strokeWidth="1.5"
+                />
+                <circle
+                  cx={30 + bezierHandles.p1x * 200}
+                  cy={130 - bezierHandles.p1y * 100}
+                  r="5"
+                  fill="#E2F952"
+                  style={{ cursor: 'pointer' }}
+                />
 
-                <line x1="240" y1="30" x2="160" y2="30" stroke="#E2F952" strokeWidth="1" />
-                <circle cx="160" cy="30" r="4" fill="#E2F952" />
+                <line
+                  x1="370"
+                  y1="30"
+                  x2={370 - (1 - bezierHandles.p2x) * 200}
+                  y2={30 + (1 - bezierHandles.p2y) * 100}
+                  stroke="#E2F952"
+                  strokeWidth="1.5"
+                />
+                <circle
+                  cx={370 - (1 - bezierHandles.p2x) * 200}
+                  cy={30 + (1 - bezierHandles.p2y) * 100}
+                  r="5"
+                  fill="#E2F952"
+                  style={{ cursor: 'pointer' }}
+                />
 
-                {/* Keyframe Nodes */}
-                <circle cx="20" cy="130" r="5" fill="#FFFFFF" stroke="#9D7BFF" strokeWidth="2" />
-                <circle cx="240" cy="30" r="5" fill="#FFFFFF" stroke="#9D7BFF" strokeWidth="2" />
-                <circle cx="380" cy="90" r="5" fill="#FFFFFF" stroke="#9D7BFF" strokeWidth="2" />
+                {/* Start & End Nodes */}
+                <circle cx="30" cy="130" r="5" fill="#FFFFFF" stroke="#9D7BFF" strokeWidth="2" />
+                <circle cx="370" cy="30" r="5" fill="#FFFFFF" stroke="#9D7BFF" strokeWidth="2" />
               </svg>
             </div>
           )}

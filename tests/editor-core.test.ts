@@ -5,6 +5,10 @@ import {
   AddClipCommand,
   TrimClipCommand,
   SplitClipCommand,
+  DuplicateClipCommand,
+  RippleDeleteClipCommand,
+  SetClipPropertyCommand,
+  AddTrackCommand,
   CreateMotionCompositionCommand,
 } from '../packages/editor-core/src';
 import { solveCubicBezier, evaluateEasing, interpolateValue } from '../packages/motion-engine/src';
@@ -96,6 +100,126 @@ describe('Command Bus & Undo/Redo System', () => {
     const reverted = store.getProject().timeline.tracks[1].clips;
     expect(reverted.length).toBe(1);
     expect(reverted[0].duration).toBe(10);
+  });
+
+  it('duplicates a clip with fresh ID at clip end', () => {
+    const store = new ProjectStore();
+    const clip: VideoClip = {
+      id: 'clip_dup',
+      name: 'Original',
+      type: 'video',
+      assetId: 'asset_1',
+      start: 2,
+      duration: 5,
+      in: 0,
+      out: 5,
+      speed: 1,
+      opacity: 1,
+      locked: false,
+      transform: {
+        position: { x: 0, y: 0 },
+        scale: { x: 1, y: 1 },
+        rotation: 0,
+        anchor: { x: 0.5, y: 0.5 },
+      },
+    };
+
+    store.dispatch(new AddClipCommand('track_video_1', clip));
+    store.dispatch(new DuplicateClipCommand('clip_dup'));
+
+    const clips = store.getProject().timeline.tracks[1].clips;
+    expect(clips.length).toBe(2);
+    expect(clips[1].start).toBe(7); // starts at 2 + 5
+
+    store.undo();
+    expect(store.getProject().timeline.tracks[1].clips.length).toBe(1);
+  });
+
+  it('performs ripple delete shifting following clips left', () => {
+    const store = new ProjectStore();
+    const c1: VideoClip = {
+      id: 'c1',
+      name: 'Clip 1',
+      type: 'video',
+      assetId: 'a1',
+      start: 0,
+      duration: 4,
+      in: 0,
+      out: 4,
+      speed: 1,
+      opacity: 1,
+      locked: false,
+      transform: { position: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotation: 0, anchor: { x: 0.5, y: 0.5 } },
+    };
+    const c2: VideoClip = {
+      id: 'c2',
+      name: 'Clip 2',
+      type: 'video',
+      assetId: 'a2',
+      start: 4,
+      duration: 6,
+      in: 0,
+      out: 6,
+      speed: 1,
+      opacity: 1,
+      locked: false,
+      transform: { position: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotation: 0, anchor: { x: 0.5, y: 0.5 } },
+    };
+
+    store.dispatch(new AddClipCommand('track_video_1', c1));
+    store.dispatch(new AddClipCommand('track_video_1', c2));
+
+    // Ripple delete c1 (duration 4)
+    store.dispatch(new RippleDeleteClipCommand('c1'));
+
+    const clips = store.getProject().timeline.tracks[1].clips;
+    expect(clips.length).toBe(1);
+    expect(clips[0].id).toBe('c2');
+    expect(clips[0].start).toBe(0); // shifted from 4 to 0
+
+    // Undo restores c1 and original c2 position
+    store.undo();
+    const restored = store.getProject().timeline.tracks[1].clips;
+    expect(restored.length).toBe(2);
+    expect(restored[1].start).toBe(4);
+  });
+
+  it('updates clip properties and supports undo', () => {
+    const store = new ProjectStore();
+    const clip: VideoClip = {
+      id: 'c_prop',
+      name: 'Test',
+      type: 'video',
+      assetId: 'a1',
+      start: 0,
+      duration: 5,
+      in: 0,
+      out: 5,
+      speed: 1,
+      opacity: 1,
+      locked: false,
+      transform: { position: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotation: 0, anchor: { x: 0.5, y: 0.5 } },
+    };
+
+    store.dispatch(new AddClipCommand('track_video_1', clip));
+    store.dispatch(new SetClipPropertyCommand('c_prop', 'speed', 2));
+
+    const updated = store.getProject().timeline.tracks[1].clips[0];
+    expect(updated.speed).toBe(2);
+
+    store.undo();
+    expect(store.getProject().timeline.tracks[1].clips[0].speed).toBe(1);
+  });
+
+  it('adds a new track and undoes correctly', () => {
+    const store = new ProjectStore();
+    const initialTracks = store.getProject().timeline.tracks.length;
+
+    store.dispatch(new AddTrackCommand('video', 'Video 2'));
+    expect(store.getProject().timeline.tracks.length).toBe(initialTracks + 1);
+
+    store.undo();
+    expect(store.getProject().timeline.tracks.length).toBe(initialTracks);
   });
 });
 
